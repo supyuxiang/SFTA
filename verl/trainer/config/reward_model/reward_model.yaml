@@ -13,7 +13,7 @@ n_gpus_per_node: 0
 nnodes: 0
 
 # FSDP strategy: "fsdp" or "fsdp2"
-strategy: ???
+strategy: fsdp
 
 # model config for reward scoring
 model:

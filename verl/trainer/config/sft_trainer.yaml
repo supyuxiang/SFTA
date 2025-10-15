@@ -16,7 +16,7 @@ data:
     tools_key: tools  # Key for tools list in multi-turn mode
     enable_thinking_key: enable_thinking  # Whether to enable thinking in multi-turn mode
   max_length: 1024
-  truncation: error
+  truncation: left
   balance_dp_token: False
   chat_template: null
   custom_cls:
@@ -49,7 +49,7 @@ optim:
   clip_grad: 1.0
   lr_scheduler: cosine
 ulysses_sequence_parallel_size: 1
-use_remove_padding: False
+use_remove_padding: True
 trainer:
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   default_hdfs_dir: null

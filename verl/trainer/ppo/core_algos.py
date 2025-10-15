@@ -295,7 +295,7 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
-    scores = token_level_rewards.sum(dim=-1)
+    scores = token_level_rewards.sum(dim=-1) #[bs, seq_len] -> [bs,]
 
     id2score = defaultdict(list)
     id2mean = {}
@@ -304,7 +304,7 @@ def compute_grpo_outcome_advantage(
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
+            id2score[index[i]].append(scores[i]) #每个group的得分
         for idx in id2score:
             if len(id2score[idx]) == 1:
                 id2mean[idx] = torch.tensor(0.0)
@@ -320,7 +320,7 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
+        scores = scores.unsqueeze(-1) * response_mask #[bs,] -> [bs, seq_len]，对于被mask的token，得分设置为0，其余设置为原始得分
 
     return scores, scores
 

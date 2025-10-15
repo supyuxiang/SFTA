@@ -49,6 +49,10 @@ actor_rollout_ref:
     # for huge model, layered summon can save memory (prevent OOM) but make it slower
     layered_summon: False
 
+    # Maximum model length for decoder prompt when using vLLM backend
+    # Increase this if your prompts are truncated by the inference engine.
+    max_model_len: 2048
+
 # custom reward function definition
 custom_reward_function:
 
@@ -112,6 +116,59 @@ algorithm:
 
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
+
+  # Reference model quality scoring configuration
+  # Let reference model score the quality of actor-generated responses and blend with original rewards.
+  # The blending weight is scheduled from 0 to max_weight within warmup_ratio of total steps.
+  ref_quality_score:
+
+    # Enable/disable reference model quality scoring
+    enable: True
+
+    # Upper bound of blending weight in [0, 1]
+    max_weight: 0.3
+
+    # Fraction of total steps to reach max_weight (0 < warmup_ratio <= 1)
+    warmup_ratio: 0.7
+
+    # Schedule type: linear | sigmoid | cosine | exp | step
+    schedule: sigmoid
+
+    # Used when schedule == step to control the number of plateaus
+    steps: 3
+
+  # Representation alignment and diversity shaping (reward shaping)
+  repr_align:
+
+    # Master switch
+    enable: True
+
+    # Encourage entropy when it's low in early stage, weight decays to 0 later
+    entropy_boost:
+      enable: True
+      max_weight: 0.1
+      warmup_ratio: 0.5
+      schedule: cosine  # linear|sigmoid|cosine|exp|step
+
+    # Penalize high similarity among n responses of the same prompt (diversity)
+    diversity_penalty:
+      enable: True
+      max_weight: 0.1
+      warmup_ratio: 0.5
+      schedule: cosine
+
+    # When entropy is high, softly align to reference representation via ref log-prob bonus
+    ref_alignment:
+      enable: True
+      max_weight: 0.2
+      warmup_ratio: 0.7
+      schedule: sigmoid
+      entropy_high_threshold: 1.0  # trigger threshold on avg entropy
+
+      # Gold representation definition:
+      #   For each sample, we compute embeddings by feeding (prompt + text) into the same HF model
+      #   and mean-pooling the last hidden states over the response segment.
+      #   Gold text comes from reward_model.ground_truth when available.
 
 # config for the trainer
 trainer:

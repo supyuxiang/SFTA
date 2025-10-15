@@ -13,45 +13,58 @@
 # limitations under the License.
 """
 A lightweight one-file FSDP SFT Trainer
+
+这是一个基于 PyTorch FSDP (Fully Sharded Data Parallel) 的监督微调(SFT)训练器。
+主要功能包括：
+1. 支持 FSDP 和 FSDP2 两种分布式训练策略
+2. 支持序列并行 (Sequence Parallelism) 和 Ulysses 优化
+3. 支持 Liger Kernel 加速
+4. 支持 LoRA 微调
+5. 支持梯度检查点和混合精度训练
+6. 支持模型检查点保存和恢复
+7. 支持训练过程中的 entropy 计算和记录
+
 TODO(zhangchi.usc1992)
-- Add calculation of mfu
+- Add calculation of mfu (Model FLOPs Utilization)
 - Add validation
 """
 
 import os
 
-os.environ["NCCL_DEBUG"] = "WARN"
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
+# 设置环境变量
+os.environ["NCCL_DEBUG"] = "INFO"  # 启用 NCCL 调试信息
+os.environ["TOKENIZERS_PARALLELISM"] = "true"  # 启用 tokenizer 并行处理
 
 import logging
 import re
-import time
 from contextlib import nullcontext
 
-import hydra
+# 核心依赖
+import hydra  # 配置管理
 import torch
 import torch.distributed
-from omegaconf import DictConfig, OmegaConf
-from peft import LoraConfig, TaskType, get_peft_model
-from tensordict import TensorDict
+from omegaconf import DictConfig, OmegaConf  # 配置处理
+from peft import LoraConfig, TaskType, get_peft_model  # LoRA 微调
+from tensordict import TensorDict  # 张量字典
 from torch import nn, optim
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.utils.data import Dataset, DistributedSampler
-from torchdata.stateful_dataloader import StatefulDataLoader
-from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh  # 设备网格
+from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy  # FSDP 组件
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # FSDP 主类
+from torch.utils.data import Dataset, DistributedSampler  # 数据加载
+from torchdata.stateful_dataloader import StatefulDataLoader  # 状态化数据加载器
+from tqdm import tqdm  # 进度条
+from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel  # HuggingFace 模型
 
-import verl.utils.hdfs_io as hdfs_io
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename
-from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-from verl.utils.dataset import SFTDataset
-from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
-from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
-from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group
-from verl.utils.fs import copy_to_local
-from verl.utils.fsdp_utils import (
+# VERL 工具库导入
+import verl.utils.hdfs_io as hdfs_io  # HDFS 文件系统操作
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename  # 检查点管理
+from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager  # FSDP 检查点管理器
+from verl.utils.dataset import SFTDataset  # 单轮对话数据集
+from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset  # 多轮对话数据集
+from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available  # 设备管理
+from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group  # 分布式初始化
+from verl.utils.fs import copy_to_local  # 文件系统操作
+from verl.utils.fsdp_utils import (  # FSDP 工具函数
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
     apply_fsdp2,
@@ -61,29 +74,40 @@ from verl.utils.fsdp_utils import (
     get_init_weight_context_manager,
     init_fn,
 )
-from verl.utils.logger import log_with_rank
-from verl.utils.profiler import log_gpu_memory_usage
-from verl.utils.py_functional import convert_to_regular_types
-from verl.utils.torch_dtypes import PrecisionType
-from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
-from verl.utils.tracking import Tracking
-from verl.utils.ulysses import (
+from verl.utils.logger import log_with_rank  # 分布式日志
+from verl.utils.profiler import log_gpu_memory_usage  # GPU 内存监控
+from verl.utils.py_functional import convert_to_regular_types  # 类型转换
+from verl.utils.torch_dtypes import PrecisionType  # 精度类型
+from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup  # 学习率调度
+from verl.utils.tracking import Tracking  # 实验跟踪
+from verl.utils.ulysses import (  # Ulysses 序列并行工具
     gather_outputs_and_unpad,
     get_ulysses_sequence_parallel_world_size,
     ulysses_pad_and_slice_inputs,
 )
-from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager  # Ulysses 分片管理器
 
+# 根据设备类型导入相应的 Flash Attention 实现
 if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input  # CUDA Flash Attention
 elif is_npu_available:
-    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
+    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input  # NPU Flash Attention
 
+# 设置日志
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
 
 def extract_step(path):
+    """
+    从检查点路径中提取步数
+    
+    Args:
+        path (str): 检查点路径，格式如 "global_step_1000"
+        
+    Returns:
+        int: 提取的步数，如果未找到则返回 None
+    """
     match = re.search(r"global_step_(\d+)", path)
     if match:
         return int(match.group(1))
@@ -91,81 +115,121 @@ def extract_step(path):
 
 
 class FSDPSFTTrainer:
+    """
+    FSDP 监督微调训练器
+    
+    这是一个基于 PyTorch FSDP 的监督微调训练器，支持：
+    - FSDP/FSDP2 分布式训练
+    - 序列并行 (Ulysses)
+    - LoRA 微调
+    - Liger Kernel 加速
+    - 梯度检查点
+    - 混合精度训练
+    - 检查点保存/恢复
+    - Entropy 计算和记录
+    """
+    
     def __init__(
         self,
-        config,
-        device_mesh: DeviceMesh,
-        ulysses_device_mesh: DeviceMesh,
-        tokenizer,
-        train_dataset: Dataset,
-        val_dataset: Dataset,
+        config,  # 训练配置
+        device_mesh: DeviceMesh,  # 全局设备网格 (用于 FSDP)
+        ulysses_device_mesh: DeviceMesh,  # Ulysses 设备网格 (用于序列并行)
+        tokenizer,  # 分词器
+        train_dataset: Dataset,  # 训练数据集
+        val_dataset: Dataset,  # 验证数据集
     ):
+        # 保存配置和组件
         self.config = config
-        self.device_mesh = device_mesh
-        self.ulysses_device_mesh = ulysses_device_mesh
-        self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+        self.device_mesh = device_mesh  # 全局设备网格
+        self.ulysses_device_mesh = ulysses_device_mesh  # Ulysses 设备网格
+        self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)  # 分片管理器
         self.tokenizer = tokenizer
+        
+        # 检查聊天模板配置
         if self.config.data.chat_template is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
 
-        # normalize dp size
+        # 标准化数据并行大小
         self._normalize_config_bsz()
 
-        # Set sequence parallel size
+        # 设置序列并行参数
         self.config.ulysses_sequence_parallel_size = getattr(self.config, "ulysses_sequence_parallel_size", 1)
         self.use_remove_padding = getattr(self.config, "use_remove_padding", False)
         if self.device_mesh.get_rank() == 0:
             print(f"Using sequence parallel size: {self.config.ulysses_sequence_parallel_size}")
             print(f"Using remove padding: {self.use_remove_padding}")
 
+        # Initialize runtime device name before building dataloaders/models
+        # Used by pin_memory_device and tensor transfers
+        self.device_name = get_device_name()
+
+        # 构建数据加载器
         self._build_dataloader(train_dataset, val_dataset)
 
-        # Initialize resume-related variables
+        # 初始化恢复相关变量
         self.resume_global_step = 0
 
-        # build model
+        # 构建模型和优化器
         self._build_model_optimizer()
 
-        # Initialize checkpoint manager
+        # 初始化检查点管理器
         self._init_checkpoint_manager()
 
+        # 加载检查点
         self.load_checkpoint()
 
+        # 打印配置信息
         if self.device_mesh.get_rank() == 0:
             print(self.config)
         self.device_name = self.config.trainer.device
 
     def _normalize_config_bsz(self):
+        """
+        标准化批处理大小配置
+        
+        根据数据并行大小调整全局批处理大小，确保：
+        1. 全局批处理大小能被数据并行大小整除
+        2. 全局批处理大小能被每个GPU的微批处理大小整除
+        """
+        # 获取数据并行大小
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
         if self.device_mesh.get_rank() == 0:
             print(f"Normalize batch size by dp {dp_size}")
 
+        # 检查全局批处理大小是否能被数据并行大小整除
         assert self.config.data.train_batch_size % dp_size == 0, (
             f"Global batch size {self.config.data.train_batch_size} is not divisible by dp size {dp_size}"
         )
 
+        # 调整全局批处理大小
         self.config.data.train_batch_size //= dp_size
 
+        # 检查调整后的批处理大小是否能被微批处理大小整除
         assert self.config.data.train_batch_size % self.config.data.micro_batch_size_per_gpu == 0
 
     def _build_dataloader(self, train_dataset, val_dataset):
-        # build dataset
+        """
+        构建数据加载器
+        
+        根据是否使用序列并行来选择不同的 rank 和 world_size：
+        - 如果使用序列并行：使用 Ulysses 设备网格的本地 rank 和 size
+        - 如果不使用序列并行：使用全局设备网格的 rank 和 size
+        """
         config = self.config
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
-        # build dataloader
-        # Use data parallel rank and size instead of global rank and world size
-
-        # If doing SP, we need to use the local rank and size
+        # 根据序列并行配置选择 rank 和 world_size
         if self.config.ulysses_sequence_parallel_size > 1:
-            rank = self.ulysses_device_mesh.get_local_rank("dp")
-            world_size = self.ulysses_device_mesh.size(0)
+            # 使用序列并行时，使用 Ulysses 设备网格的本地信息
+            rank = self.ulysses_device_mesh.get_local_rank("dp")  # 获取当前进程在数据并行组中的本地 rank
+            world_size = self.ulysses_device_mesh.size(0)  # 获取数据并行组中的总进程数
             if self.ulysses_device_mesh.get_rank() == 0:
                 print(f"Using SP rank {rank} and size {world_size} for data distribution")
                 print("Each SP rank gets different data, but the same data WITHIN the same rank")
         else:
-            rank = self.device_mesh.get_rank()
-            world_size = self.device_mesh.size()
+            # 不使用序列并行时，使用全局设备网格信息
+            rank = self.device_mesh.get_rank()  # 获取当前进程在全局设备网格中的 rank
+            world_size = self.device_mesh.size()  # 获取全局设备网格中的总进程数
         if self.device_mesh.get_rank() == 0:
             print(f"Using FSDP rank {rank} and size {world_size} for data distribution")
 
@@ -182,7 +246,9 @@ class FSDPSFTTrainer:
             num_workers=8,
             pin_memory=True,
             drop_last=True,
-            pin_memory_device=device_name,
+            # Avoid binding CUDA contexts to rank-0 GPU from DataLoader workers
+            # Keep pinned memory on CPU to prevent stray contexts on device 0
+            pin_memory_device=self.device_name,
         )
 
         self.val_sampler = DistributedSampler(
@@ -195,7 +261,7 @@ class FSDPSFTTrainer:
             num_workers=8,
             pin_memory=True,
             drop_last=True,
-            pin_memory_device=device_name,
+            pin_memory_device=self.device_name,
         )
 
     def _build_model_optimizer(self):
@@ -352,125 +418,218 @@ class FSDPSFTTrainer:
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 
-    def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
-        """Compute loss with optional sequence parallelism and remove padding features"""
+    def _compute_loss_and_backward(self, batch, do_backward=True):
+        """
+        计算损失和熵，并可选地执行反向传播
+        
+        这个方法支持两种模式：
+        1. 标准模式：不使用序列并行
+        2. 序列并行模式：使用 Ulysses 序列并行和 remove padding
+        
+        Args:
+            batch: 输入批次数据，包含 input_ids, attention_mask, position_ids, loss_mask
+            do_backward: 是否执行反向传播
+            
+        Returns:
+            tuple: (loss, entropy) 损失值和平均熵
+        """
+        # 判断是否使用序列并行
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
 
-        # Move inputs to GPU and prepare loss mask
+        # 将输入数据移动到 GPU 并准备损失掩码
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
-        loss_fct = nn.CrossEntropyLoss(reduction="none")
+        loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).to(self.device_name)  # 移除最后一个token的损失
+        loss_fct = nn.CrossEntropyLoss(reduction="none")  # 不进行reduction，保持每个token的损失
+        
+        # 初始化熵跟踪变量
+        total_entropy = 0.0
+        total_valid_tokens = 0
 
-        # Context manager for sequence parallel if needed
+        # 根据是否使用序列并行选择上下文管理器
         context = self.sharding_manager if use_sp else nullcontext()
         with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             if not use_sp:
-                # Standard forward pass without sequence parallel
+                # ========== 标准模式：不使用序列并行 ==========
+                # 准备标签（输入序列向右偏移一位）
                 labels = input_ids[:, 1:].contiguous()
+                
+                # 前向传播
                 output = self.fsdp_model(
                     input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
                 )
                 logits = output.logits
 
-                shift_logits = logits[..., :-1, :].contiguous()
+                # 准备用于损失计算的 logits 和 labels
+                shift_logits = logits[..., :-1, :].contiguous()  # 移除最后一个token的logits
                 shift_labels = labels.contiguous()
-                # Flatten the tokens
-                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
+                
+                # 展平张量以便计算损失
+                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)  # (batch_size * seq_len, vocab_size)
+                shift_labels = shift_labels.view(-1)  # (batch_size * seq_len,)
+                
+                # 确保标签在正确的设备上
                 shift_labels = shift_labels.to(shift_logits.device)
+                
+                # 计算损失
                 loss = loss_fct(shift_logits, shift_labels)
-                loss = loss * loss_mask.to(loss.device)
+                loss = loss * loss_mask.to(loss.device)  # 只计算有效token的损失
+                
+                # ========== 计算熵 ==========
+                # 计算每个token位置的熵
+                probs = torch.softmax(shift_logits, dim=-1)  # 概率分布
+                log_probs = torch.log_softmax(shift_logits, dim=-1)  # 对数概率
+                entropy = -torch.sum(probs * log_probs, dim=-1)  # 熵: H = -Σ(p * log(p))
+                
+                # 只计算有效token的熵
+                valid_entropy = entropy * loss_mask.to(entropy.device)
+                total_entropy = torch.sum(valid_entropy)
+                total_valid_tokens = torch.sum(loss_mask)
             else:
-                # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
-                # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
-                # 1. All SP ranks will receive the *SAME* batch
-                # 2. Different SP groups will receive *DIFFERENT* batches
-                # This is implemented by the DistributedSampler
+                # ========== 序列并行模式：使用 Ulysses 序列并行 ==========
+                # 重要假设：同一个序列可以在不同的SP rank之间分片
+                # 即：每个GPU处理 <1 个序列，每个SP组处理1个序列
+                # 1. 所有SP rank会接收到*相同*的批次
+                # 2. 不同的SP组会接收到*不同*的批次
+                # 这通过 DistributedSampler 实现
 
                 batch_size, seqlen = input_ids.shape
-                # Remove padding
+                
+                # ========== 移除填充 ==========
+                # 移除padding tokens以提高效率
                 input_ids_rmpad, indices, *_ = unpad_input(
                     input_ids.unsqueeze(-1), attention_mask
                 )  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
-                # Unpad position_ids to align rotary
+                # 移除position_ids的填充以对齐旋转位置编码
                 position_ids_rmpad = index_first_axis(
                     rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
                 ).transpose(0, 1)
 
-                # Pad and slice inputs for sequence parallelism
+                # ========== 序列并行处理 ==========
+                # 为序列并行填充和切片输入
                 input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
                     input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
                 )
-                # For computing loss
+                
+                # 为计算损失准备标签（向右滚动一位）
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
                 input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
                     input_ids_rmpad_rolled, None, get_ulysses_sequence_parallel_world_size()
                 )
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
-                # Forward pass
+                # ========== 前向传播 ==========
                 output = self.fsdp_model(
                     input_ids=input_ids_rmpad_sliced,
-                    attention_mask=None,  # Not needed with flash attention varlen
+                    attention_mask=None,  # Flash attention varlen 不需要 attention_mask
                     position_ids=position_ids_rmpad_padded,
                     use_cache=False,
                 )
 
-                # Compute loss locally then aggregate
+                # ========== 计算损失和熵 ==========
                 logits_rmpad = output.logits.squeeze(0)
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
                 loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
-                # Gather and unpad for sequence parallelism
+                
+                # 计算序列并行情况下的熵
+                probs_rmpad = torch.softmax(logits_rmpad, dim=-1)
+                log_probs_rmpad = torch.log_softmax(logits_rmpad, dim=-1)
+                entropy_rmpad = -torch.sum(probs_rmpad * log_probs_rmpad, dim=-1)
+                
+                # ========== 序列并行聚合 ==========
+                # 从所有 Ulysses rank 收集并移除填充
                 loss = gather_outputs_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                entropy_rmpad = gather_outputs_and_unpad(entropy_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size)
 
-                # This is the loss collected from all ulysses ranks
+                # ========== 恢复原始形状 ==========
+                # 这是从所有 Ulysses rank 收集的损失
                 full_loss = pad_input(
                     hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
                 )
-                full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
+                full_entropy = pad_input(
+                    hidden_states=entropy_rmpad.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
+                )
+                
+                # 移除最后一个token的损失和熵
+                full_loss = full_loss.squeeze(-1)[:, :-1]
+                full_entropy = full_entropy.squeeze(-1)[:, :-1]
                 full_loss = full_loss.reshape(-1)
+                full_entropy = full_entropy.reshape(-1)
                 loss_mask = loss_mask.to(full_loss.device)
                 loss = full_loss * loss_mask
+                
+                # 计算有效token的熵
+                valid_entropy = full_entropy * loss_mask.to(full_entropy.device)
+                total_entropy = torch.sum(valid_entropy)
+                total_valid_tokens = torch.sum(loss_mask)
 
+            # ========== 损失和熵的最终计算 ==========
             valid_token_this_rank = torch.sum(loss_mask)
 
+            # 如果启用了数据并行token平衡，则进行all_reduce
             if self.config.data.balance_dp_token:
                 torch.distributed.all_reduce(valid_token_this_rank)
                 dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
             else:
                 dp_size = 1
 
+            # 计算平均损失
             loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+            
+            # 计算有效token的平均熵
+            if total_valid_tokens > 0:
+                avg_entropy = total_entropy / (total_valid_tokens + 1e-8)
+            else:
+                avg_entropy = torch.tensor(0.0, device=loss.device)
 
-            loss = loss / n_micro_batches  # normalize loss
-
+            # 可选的反向传播
             if do_backward:
                 loss.backward()
-            return loss
+            return loss, avg_entropy
 
     def training_step(self, batch: TensorDict):
-        start_time = time.time()
-
+        """
+        执行一个训练步骤
+        
+        包括：
+        1. 梯度清零
+        2. 微批次处理
+        3. 损失和熵计算
+        4. 梯度裁剪
+        5. 优化器步骤
+        6. 学习率调度
+        
+        Args:
+            batch: 输入批次数据
+            
+        Returns:
+            dict: 包含损失、熵和学习率的指标字典
+        """
         self.fsdp_model.train()
 
         log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
 
+        # 清零梯度
         self.optimizer.zero_grad()
 
         log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
 
+        # 将批次分割为微批次以节省内存
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
+        step_entropy = torch.tensor(0.0, device=self.device_name)
+        
+        # 处理每个微批次
         for micro_batch in micro_batches:
-            loss = self._compute_loss_and_backward(batch=micro_batch, n_micro_batches=n_micro_batches)
-            step_loss += loss.item()
+            loss, entropy = self._compute_loss_and_backward(batch=micro_batch)
+            step_loss += loss.item() / n_micro_batches
+            step_entropy += entropy / n_micro_batches
 
+        # ========== 梯度裁剪 ==========
         if self.config.model.strategy == "fsdp":
             grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
         elif self.config.model.strategy == "fsdp2":
@@ -480,7 +639,8 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("Before optimizer step", logger=logger)
 
-        # if grad_norm is not finite, skip the update
+        # ========== 优化器步骤 ==========
+        # 如果梯度范数不是有限的，跳过更新
         if not torch.isfinite(grad_norm):
             print(f"WARN: grad_norm is not finite: {grad_norm}")
             self.optimizer.zero_grad()
@@ -489,40 +649,45 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After optimizer step", logger=logger)
 
+        # ========== 学习率调度 ==========
         self.lr_scheduler.step()
-
-        # reduce loss across dp ranks
         lr = self.lr_scheduler.get_last_lr()[0]
 
         log_gpu_memory_usage("After offload weights", logger=logger)
 
+        # ========== 分布式聚合 ==========
+        # 在所有数据并行rank之间平均损失和熵
         step_loss = torch.tensor(step_loss).to(self.device_name)
-
-        # compute time spent per step
-        end_time = time.time()
-        spend_time_per_step = end_time - start_time
-
+        # step_entropy 已经是tensor，不需要再转换
         if is_cuda_available:
             torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+            torch.distributed.all_reduce(step_entropy, op=torch.distributed.ReduceOp.AVG)
         elif is_npu_available:
             torch.distributed.all_reduce(step_loss)
+            torch.distributed.all_reduce(step_entropy)
             step_loss /= self.device_mesh.size(0)
+            step_entropy /= self.device_mesh.size(0)
+            
         return {
-            "train/loss": step_loss.detach().item(),
-            "train/lr(1e-3)": lr * 1e3,
-            "train/time(s)": spend_time_per_step,
+            "train/loss": step_loss.detach().item(), 
+            "train/entropy": step_entropy.detach().item(),
+            "train/lr(1e-3)": lr * 1e3
         }
 
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
         with torch.no_grad():
-            loss = self._compute_loss_and_backward(batch, do_backward=False)
+            loss, entropy = self._compute_loss_and_backward(batch, do_backward=False)
+            # loss 和 entropy 已经是 tensor；直接 all_reduce 后转为 float 返回
             if is_cuda_available:
                 torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+                torch.distributed.all_reduce(entropy, op=torch.distributed.ReduceOp.AVG)
             elif is_npu_available:
                 torch.distributed.all_reduce(loss)
+                torch.distributed.all_reduce(entropy)
                 loss /= self.device_mesh.size(0)
-        return loss
+                entropy /= self.device_mesh.size(0)
+            return {"val/loss": loss.item(), "val/entropy": entropy.item()}
 
     def save_checkpoint(self, step):
         """Save checkpoint using FSDPCheckpointManager with improved tracking"""
@@ -694,8 +859,19 @@ class FSDPSFTTrainer:
         return latest_checkpoint
 
     def fit(self):
+        """
+        主训练循环
+        
+        执行完整的训练过程，包括：
+        1. 初始化实验跟踪
+        2. 计算总训练步数
+        3. 训练循环（支持断点续训）
+        4. 定期验证和保存检查点
+        5. 早停机制
+        """
         rank = self.device_mesh.get_rank()
 
+        # ========== 初始化实验跟踪 ==========
         # TODO: add a unified tracking
         if rank == 0:
             tracking = Tracking(
@@ -705,12 +881,14 @@ class FSDPSFTTrainer:
                 config=OmegaConf.to_container(self.config, resolve=True),
             )
 
-        global_step = self.resume_global_step  # Start from resumed step
+        # ========== 计算总训练步数 ==========
+        global_step = self.resume_global_step  # 从恢复的步数开始
         last_valid_metric = None
-        # compute the total training steps.
-        # the total training steps in SFT is mainly for early exit
+        
+        # 计算总训练步数（主要用于早停）
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
+        # 如果配置中指定了总训练步数，则使用配置的值
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
 
@@ -722,8 +900,9 @@ class FSDPSFTTrainer:
             log_only_rank_0=True,
         )
 
-        # With StatefulDataLoader, we don't need to manually calculate epochs and steps
-        # The dataloader will automatically resume from where it left off
+        # ========== 断点续训处理 ==========
+        # 使用 StatefulDataLoader，不需要手动计算epoch和步数
+        # 数据加载器会自动从上次停止的地方恢复
         if global_step > 0:
             log_with_rank(
                 f"StatefulDataLoader will automatically resume from global step: {global_step}",
@@ -732,79 +911,123 @@ class FSDPSFTTrainer:
                 log_only_rank_0=True,
             )
 
-        # Calculate which epoch we're starting from for sampler.set_epoch()
+        # 计算从哪个epoch开始（用于sampler.set_epoch()）
         start_epoch = global_step // self.steps_per_epoch
 
-        train_time = 0
+        # ========== 主训练循环 ==========
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
+            # 设置epoch以确保数据打乱的一致性
             self.train_sampler.set_epoch(epoch=epoch)
 
+            # 遍历训练数据
             for step_in_epoch, data in enumerate(
                 tqdm(
                     self.train_dataloader,
                     initial=global_step % self.steps_per_epoch if epoch == start_epoch else 0,
                     total=self.steps_per_epoch,
                     desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
-                    disable=rank != 0,
+                    disable=rank != 0,  # 只在rank 0显示进度条
                 )
             ):
                 global_step += 1
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
+                
+                # 执行训练步骤
                 metric = self.training_step(data)
-                train_time += metric["train/time(s)"]
+                
+                # 记录训练指标
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
 
+                # ========== 检查是否需要验证、保存或停止 ==========
                 is_last_step = global_step >= self.total_training_steps
                 is_valid_step = global_step % self.config.trainer.test_freq == 0
                 is_save_step = global_step % self.config.trainer.save_freq == 0
 
-                # early exit or validation step
+                # ========== 验证步骤 ==========
                 if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
-                    # Perform validation
-                    val_losses = []
+                    # 执行验证
+                    val_metrics = []
                     for val_data in self.val_dataloader:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
                             self.device_name
                         )
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
+                        val_metric = self.validation_step(val_data)
+                        val_metrics.append(val_metric)
+                    
                     if rank == 0:
-                        val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {"val/loss": val_loss.detach().item()}
+                        # 平均验证指标（val_metrics 中元素是 float）
+                        avg_val_loss = sum(m["val/loss"] for m in val_metrics) / len(val_metrics)
+                        avg_val_entropy = sum(m["val/entropy"] for m in val_metrics) / len(val_metrics)
+                        metric = {
+                            "val/loss": float(avg_val_loss),
+                            "val/entropy": float(avg_val_entropy)
+                        }
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
                     torch.distributed.barrier()
 
+                # ========== 保存检查点 ==========
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
                     self.save_checkpoint(step=global_step)
 
+                # ========== 早停检查 ==========
                 if is_last_step:
+                    # 在退出前各 rank 同步，避免销毁时竞争
+                    try:
+                        torch.distributed.barrier()
+                    except Exception:
+                        pass
                     if rank == 0:
-                        print(f"Total time for train steps: {train_time:.2f}s")
                         print(f"Final validation metrics: {last_valid_metric}")
                     return
 
 
 def run_sft(config):
+    """
+    运行监督微调训练
+    
+    这是训练的主入口函数，负责：
+    1. 初始化分布式环境
+    2. 创建设备网格
+    3. 加载模型和数据集
+    4. 创建训练器
+    5. 执行训练
+    6. 清理资源
+    
+    Args:
+        config: 训练配置对象
+    """
+    # ========== 初始化分布式环境 ==========
     device_name = get_device_name()
     local_rank, rank, world_size = initialize_global_process_group()
 
+    # ========== 创建设备网格 ==========
+    # 全局设备网格（用于FSDP）
     device_mesh = init_device_mesh(device_type=device_name, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    
+    # Ulysses设备网格（用于序列并行）
     dp_size = world_size // config.ulysses_sequence_parallel_size
     ulysses_device_mesh = init_device_mesh(
         device_type=device_name,
         mesh_shape=(dp_size, config.ulysses_sequence_parallel_size),
         mesh_dim_names=("dp", "sp"),
     )
-    # build tokenizer and datasets first
+    
+    # ========== 构建分词器和数据集 ==========
     from verl.utils import hf_tokenizer
 
+    # 下载模型到本地
     local_model_path = copy_to_local(src=config.model.partial_pretrain, verbose=True)
+    
+    # 创建分词器
     tokenizer = hf_tokenizer(local_model_path, trust_remote_code=config.model.trust_remote_code)
+    
+    # 创建训练和验证数据集
     train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
     val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
+    # ========== 创建训练器并开始训练 ==========
     trainer = FSDPSFTTrainer(
         config=config,
         device_mesh=device_mesh,
@@ -814,32 +1037,65 @@ def run_sft(config):
         val_dataset=val_dataset,
     )
 
+    # 执行训练
     trainer.fit()
 
+    # ========== 清理资源 ==========
+    # 同步并释放 GPU 缓存，降低销毁通信组时的显存压力
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    
+    try:
+        torch.distributed.barrier()
+    except Exception:
+        pass
+    
     destroy_global_process_group()
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
 def main(config):
+    """
+    主函数入口
+    
+    使用 Hydra 进行配置管理，然后调用 run_sft 开始训练
+    """
     run_sft(config)
 
 
 def create_sft_dataset(data_paths, data_config, tokenizer):
-    """Create a dataset."""
-    # build dataset
-    # First check if a custom dataset class is specified
+    """
+    创建SFT数据集
+    
+    根据配置选择合适的数据集类型：
+    1. 自定义数据集类
+    2. 多轮对话数据集
+    3. 单轮对话数据集（默认）
+    
+    Args:
+        data_paths: 数据文件路径
+        data_config: 数据配置
+        tokenizer: 分词器
+        
+    Returns:
+        Dataset: 创建的数据集对象
+    """
+    # 首先检查是否指定了自定义数据集类
     if data_config.custom_cls.get("path", None):
         from verl.utils.import_utils import load_extern_type
-
         dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
-    # Then check if multi-turn dataset should be used
+    # 然后检查是否应该使用多轮对话数据集
     elif data_config.get("multiturn", {}).get("enable", False):
         dataset_cls = MultiTurnSFTDataset
-    # Default to single-turn dataset
+    # 默认使用单轮对话数据集
     else:
         dataset_cls = SFTDataset
 
-    # Create datasets based on the selected class
+    # 根据选择的类创建数据集
     dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)
     return dataset
 

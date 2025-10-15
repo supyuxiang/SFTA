@@ -24,14 +24,14 @@ The word set comes from shakespeare
 import os.path
 import random
 
-prompt_template = "How many {} are there in word {}?"
+prompt_template = "Let's think step by step. How many {} are there in word {}?"
 
 
 def generate_random_char():
     return chr(97 + random.randint(0, 25))
 
 
-def create_prompt_response(min_length=3, max_length=5):
+def create_prompt_response(min_length=50, max_length=100):
     # randomly generate a length
     word_length = random.randint(min_length, max_length)
     # randomly generate a target count number. This makes the target number
@@ -87,9 +87,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total_number", type=int, default=10000)
-    parser.add_argument("--min_length", type=int, default=5)
-    parser.add_argument("--max_length", type=int, default=20)
+    parser.add_argument("--total_number", type=int, default=100000)
+    parser.add_argument("--min_length", type=int, default=50)
+    parser.add_argument("--max_length", type=int, default=100)
     parser.add_argument("--data_path", type=str, default="~/data/char_count")
 
     args = vars(parser.parse_args())

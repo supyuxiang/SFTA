@@ -42,12 +42,20 @@ def default_compute_score(
     """
     if data_source == "openai/gsm8k":
         from . import gsm8k
+        
+        # 添加调试信息
+        print(f"[DEBUG] default_compute_score called with:")
+        print(f"  data_source: {data_source}")
+        print(f"  solution_str length: {len(solution_str) if solution_str else 'None'}")
+        print(f"  ground_truth: {ground_truth}")
+        print(f"  extra_info: {extra_info}")
 
-        res = gsm8k.compute_score(solution_str, ground_truth)
+        res = gsm8k.compute_score(solution_str, ground_truth) #从gsm8k.py中获取compute_score函数
+
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
         from . import math_reward
 
-        res = math_reward.compute_score(solution_str, ground_truth)
+        res = math_reward.compute_score(solution_str, ground_truth) #从math_reward.py中获取compute_score函数
         # [Optional] Math-Verify Integration
         # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
         # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
@@ -58,7 +66,7 @@ def default_compute_score(
     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
         from . import math_dapo
 
-        res = math_dapo.compute_score(solution_str, ground_truth)
+        res = math_dapo.compute_score(solution_str, ground_truth) #从math_dapo.py中获取compute_score函数
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",
@@ -69,7 +77,7 @@ def default_compute_score(
     ]:
         from . import prime_math
 
-        res = prime_math.compute_score(solution_str, ground_truth)
+        res = prime_math.compute_score(solution_str, ground_truth) #从prime_math.py中获取compute_score函数
     elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
         # Use the passed sandbox_fusion_url if available
         if sandbox_fusion_url:

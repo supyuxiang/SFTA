@@ -31,7 +31,7 @@ def extract_solution(solution_str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/math")
+    parser.add_argument("--local_dir", default="/home/yxfeng/data/math")
     parser.add_argument("--hdfs_dir", default=None)
 
     args = parser.parse_args()
@@ -72,6 +72,8 @@ if __name__ == "__main__":
 
     local_dir = os.path.expanduser(args.local_dir)
     hdfs_dir = args.hdfs_dir
+
+    os.makedirs(local_dir, exist_ok=True)
 
     train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_dir, "test.parquet"))

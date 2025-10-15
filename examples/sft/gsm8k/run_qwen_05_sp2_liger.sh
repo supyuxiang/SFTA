@@ -1,15 +1,18 @@
 set -x
 
-if [ "$#" -lt 2 ]; then
+
+if [ "$#" -lt 0 ]; then
     echo "Usage: run_qwen_05_sp2.sh <nproc_per_node> <save_path> [other_configs...]"
     exit 1
 fi
 
-nproc_per_node=$1
-save_path=$2
+CUDA_VISIBLE_DEVICES=1,2,3,4
+nproc_per_node=4
+model_dir=/home/yxfeng/models/qwen/Qwen2.5-1.5B-Instruct
+save_path=/home/yxfeng/models/qwen/Qwen2.5-1.5B-Instruct-sft
 
 # Shift the arguments so $@ refers to the rest
-shift 2
+shift 0
 
 torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
      -m verl.trainer.fsdp_sft_trainer \
@@ -21,11 +24,11 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.prompt_dict_keys=['question'] \
     +data.response_dict_keys=['answer'] \
     data.micro_batch_size=4 \
-    model.partial_pretrain=Qwen/Qwen2.5-0.5B-Instruct \
+    model.partial_pretrain=$model_dir \
     model.use_liger=True \
     trainer.default_local_dir=$save_path \
     trainer.project_name=gsm8k-sft \
-    trainer.experiment_name=gsm8k-sft-qwen-2.5-0.5b-instruct-sp2-liger \
+    trainer.experiment_name=gsm8k-sft-qwen-2.5-1.5b-instruct-sp2-liger \
     trainer.logger=console $@ \
     ulysses_sequence_parallel_size=2 \
     use_remove_padding=true

@@ -77,12 +77,31 @@ class NaiveRewardManager(AbstractRewardManager):
             # decode
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            # 规范化最终答案格式：若存在 \boxed{d} 且缺少以 #### 开头的行，则追加一行 "#### d"
+            try:
+                if "####" not in response_str:
+                    import re as _re
+                    m = _re.findall(r"\\boxed\{\s*([0-9]+(?:\.[0-9]+)?)\s*\}", response_str)
+                    if m:
+                        response_str = response_str.rstrip() + f"\n#### {m[-1]}"
+            except Exception:
+                pass
 
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
             extra_info = data_item.non_tensor_batch.get("extra_info", {})
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             extra_info["num_turns"] = num_turns
+
+            # 添加调试信息
+            print(f"[DEBUG] data_source: {data_source}")
+            print(f"[DEBUG] ground_truth: {ground_truth}")
+            print(f"[DEBUG] response_str length: {len(response_str)}")
+            
+            # 安全检查
+            if ground_truth is None:
+                print(f"[WARNING] ground_truth is None for data_source: {data_source}")
+                ground_truth = ""  # 使用空字符串作为默认值
 
             score = self.compute_score(
                 data_source=data_source,

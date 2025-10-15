@@ -25,6 +25,7 @@ from dataclasses import asdict
 from typing import Any, Optional
 
 import numpy as np
+from tensordict import TensorDict
 import psutil
 import torch
 import torch.distributed
@@ -1001,6 +1002,376 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module.reshard()
 
         return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="ref_generate_quality_score")
+    def generate_quality_score(self, data: DataProto):
+        """让参考模型生成质量评分，包括分析过程和最终分数。
+        
+        参考模型会生成分析过程，最终分数以前缀 "#### <number>" 的形式单独占一行输出。
+        
+        Args:
+            data: 包含输入和输出的数据批次
+            
+        Returns:
+            DataProto: 包含质量评分的批次数据
+        """
+        # 确保有rollout能力才能生成质量评分
+        assert self._is_rollout, "generate_quality_score requires rollout capability"
+        # 构建质量评分提示
+        quality_prompts = self._build_quality_score_prompts(data)
+        
+        # 设置生成参数（限制新生成长度，避免超出vLLM max_model_len）
+        quality_prompts.meta_info.update({
+            "do_sample": True,
+            "temperature": 0.7,
+            "max_new_tokens": 128,  # 收紧生成长度，避免超长
+            "pad_token_id": self.model_config.tokenizer.pad_token_id,
+            "eos_token_id": self.model_config.tokenizer.eos_token_id,
+        })
+        
+        # 使用参考模型生成质量评分
+        # 直接调用ActorRolloutRefWorker的generate_sequences方法
+        with self.ulysses_sharding_manager:
+            quality_prompts = quality_prompts.to("cpu")
+            output = self.generate_sequences(prompts=quality_prompts)
+            output = output.to("cpu")
+        
+        # 原始版本：从生成的文本中提取质量分数
+        # quality_scores = self._extract_quality_scores_from_generation(output)
+        
+        # 修改版本：从生成的文本中提取质量分数和评价文本
+        quality_scores, evaluation_texts = self._extract_quality_scores_from_generation(output)
+        
+        # 修改版本：打印reference model的评价文本（仅在前几个样本）
+        if len(evaluation_texts) > 0:
+            print(f"\n{'='*80}")
+            print(f"REFERENCE MODEL QUALITY EVALUATIONS (Step {getattr(self, 'global_steps', 'unknown')})")
+            print(f"{'='*80}")
+            for i, text in enumerate(evaluation_texts[:3]):  # 只显示前3个样本
+                print(f"\n--- Reference Evaluation {i+1} ---")
+                print(f"Evaluation Text: {text[:500]}{'...' if len(text) > 500 else ''}")
+                print(f"Extracted Score: {quality_scores[i].item():.3f}")
+                print("-" * 50)
+            print(f"{'='*80}\n")
+        
+        return DataProto.from_dict(tensors={"quality_scores": quality_scores})
+    
+    def _build_quality_score_prompts(self, data: DataProto):
+        """构建质量评分提示词。
+        
+        Args:
+            data: 原始数据批次
+            
+        Returns:
+            DataProto: 包含质量评分提示的数据批次
+        """
+        # 从raw_prompt中提取输入和输出文本
+        raw_prompts = data.non_tensor_batch.get("raw_prompt", [])
+        # 兼容numpy.ndarray输入，避免直接在ndarray上做if判断触发ambiguous错误
+        if isinstance(raw_prompts, np.ndarray):
+            raw_prompts_list = raw_prompts.tolist()
+        else:
+            raw_prompts_list = raw_prompts
+
+        # 判空时使用显式len检查，避免ndarray布尔歧义
+        if not (isinstance(raw_prompts_list, list) and len(raw_prompts_list) > 0):
+            # 如果没有raw_prompt，尝试从input_texts和output_texts获取
+            input_texts = data.non_tensor_batch.get("input_texts", [])
+            output_texts = data.non_tensor_batch.get("output_texts", [])
+            if input_texts and output_texts:
+                raw_prompts_list = [{"input": inp, "output": out} for inp, out in zip(input_texts, output_texts)]
+        
+        quality_prompts = []
+        if not (isinstance(raw_prompts_list, list) and len(raw_prompts_list) > 0):
+            # 如果没有数据，返回空的DataProto（使用TensorDict而非dict）
+            empty_td = TensorDict(
+                source={
+                    "input_ids": torch.empty((0, 1), dtype=torch.long),
+                    "attention_mask": torch.empty((0, 1), dtype=torch.long),
+                },
+                batch_size=(0,),
+            )
+            return DataProto(batch=empty_td, non_tensor_batch={"prompt_texts": np.array([], dtype=object)})
+
+        for raw_prompt in raw_prompts_list:
+            # 从raw_prompt中提取输入和输出文本
+            if isinstance(raw_prompt, list):
+                # raw_prompt是消息列表，格式如：[{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+                input_text = ""
+                output_text = ""
+                for message in raw_prompt:
+                    if message.get("role") == "user":
+                        input_text = message.get("content", "")
+                    elif message.get("role") == "assistant":
+                        output_text = message.get("content", "")
+            elif isinstance(raw_prompt, dict):
+                # raw_prompt是字典，格式如：{"input": "...", "output": "..."}
+                input_text = raw_prompt.get("input", "")
+                output_text = raw_prompt.get("output", "")
+            else:
+                # 如果格式不匹配，跳过
+                continue
+            # 构建质量评分提示（增强版）
+            prompt = f"""You are a professional quality evaluator. Please provide an objective and detailed scoring and brief analysis for the given "question-answer" pair.
+
+【Question】
+{input_text}
+
+【Answer】
+{output_text}
+
+【Scoring Dimensions (Total 10 points)】
+- Accuracy (0-5 points): Are the facts correct, conclusions relevant to the question with no obvious errors/assumptions.
+- Completeness (0-2 points): Are key steps/points complete, covering necessary boundary conditions and conclusions.
+- Logic (0-2 points): Is the reasoning self-consistent, do steps have causal/sequential relationships, avoiding jumps and contradictions.
+- Clarity (0-1 points): Is the expression clear, structure reasonable, easy for readers to understand and reproduce.
+
+【Common Deduction Rules (Examples)】
+- Deviating from the question, no answer, or obvious errors: Accuracy ≤2 points.
+- Missing key steps/conclusions: Completeness -1 to -2 points.
+- Reasoning jumps, contradictions: Logic -1 to -2 points.
+- Ambiguous expression, no structure: Clarity -1 point.
+
+【Scoring Process】
+1) Provide brief comments and sub-scores for each of the four dimensions;
+2) Summarize as "Overall Score" (0-10, supports decimals, recommended to 0.5 point granularity);
+3) Normalization: Compute Normalized Score = Overall Score / 10, then clamp it into [0, 1].
+4) Finally output exactly one line in the format: "#### <Normalized Score>", where the number MUST be between 0 and 1.
+
+【Examples (follow the exact style and format; GSM8K-like)】
+Example 1 (correct reasoning with step-by-step thinking):
+Question: A school has 4 classes in third grade, each with 28 students. The school buys 3 workbooks for each third grader. Each workbook costs $4. How much does the school spend in total? Let's think step by step.
+Answer: Let's think step by step.
+- First, I need to find the total number of third grade students: 4 classes × 28 students per class = 112 students.
+- Next, I need to calculate the total number of workbooks needed: 112 students × 3 workbooks per student = 336 workbooks.
+- Finally, I need to find the total cost: 336 workbooks × $4 per workbook = $1,344.
+Therefore, the school spends $1,344 in total.
+final answer is ####10
+1. Accuracy: All numbers and units are correct, sub-score 5/5
+2. Completeness: Covers students → books → price, sub-score 2/2
+3. Logic: Clear stepwise calculation with proper reasoning, sub-score 2/2
+4. Clarity: Concise with units and clear structure, sub-score 1/1
+5. Overall Score: 10/10
+#### 10
+
+Example 2 (typical mistake, no step-by-step thinking):
+Question: A store has 75 pencils, sells 29 in the morning and 36 in the afternoon. How many are left? Let's think step by step.
+Answer: 75 − 29 + 36 = 82, so 82 left.
+final answer is ####3
+1. Accuracy: Should be subtraction in both steps (75−29−36=10), sub-score 1/5
+2. Completeness: No intermediate explanation or step-by-step reasoning, sub-score 1/2
+3. Logic: Treats "sell" as "add", wrong direction, no step-by-step thinking, sub-score 0/2
+4. Clarity: Readable but ambiguous symbols, sub-score 1/1
+5. Overall Score: 3/10
+#### 3
+
+Example 3 (partially correct, medium score, some step-by-step thinking):
+Question: Sarah buys 5 packs of stickers. Each pack has 18 stickers. She gives 22 stickers to her friends. How many stickers does she have left? Let's think step by step.
+Answer: Let's think step by step.
+- Total stickers: 5×18 = 90.
+- Stickers given away: 22.
+- Remaining: 90 − 22 = 68.
+final answer is ####68
+1. Accuracy: Final answer 68 is correct, sub-score 5/5
+2. Completeness: Has core steps, but no unit checks or brief justification for multiplication, sub-score 1/2
+3. Logic: Steps are in reasonable order, minor brevity in explanation, sub-score 1/2
+4. Clarity: Clear but minimal detail; still easy to follow, sub-score 1/1
+5. Overall Score: 8/10
+#### 8
+
+Example 4 (incomplete reasoning, around 5, minimal step-by-step thinking):
+Question: A farmer collects 42 eggs on Monday and 37 eggs on Tuesday. He packs eggs into cartons that hold 12 eggs each. How many full cartons can he make and how many eggs are left over? Let's think step by step.
+Answer: Let's think step by step.
+- Total eggs: 42 + 37 = 79.
+- Full cartons: 79 ÷ 12 ≈ 6 (since 6×12 = 72).
+- Leftover: 79 − 72 = 7.
+final answer is ####7
+1. Accuracy: Results (6 cartons, 7 leftover) are correct, sub-score 4/5
+2. Completeness: Steps are minimal; no mention of floor division or justification, sub-score 0/2
+3. Logic: Order is reasonable but lacks explanation about rounding, sub-score 1/2
+4. Clarity: Short and readable but terse, sub-score 0/1
+5. Overall Score: 5/10
+#### 5
+
+【Output Format (Strictly Follow)】
+1. Accuracy: [Brief description, sub-score x/5]
+2. Completeness: [Brief description, sub-score x/2]
+3. Logic: [Brief description, sub-score x/2]
+4. Clarity: [Brief description, sub-score x/1]
+5. Overall Score: x/10
+#### x
+
+【Format Requirements】
+- Your output must be in pure English, do not include any other languages.
+- The end must contain exactly one line starting with "#### " followed by a number x (0-10, one decimal allowed).
+- Do not include units or extra text after the number on the "#### " line; do not output multiple "####" lines.
+- think step by step
+"""
+            
+            quality_prompts.append(prompt)
+
+        # 将文本提示编码为模型输入（TensorDict），以便下游 .to() 正常工作
+        tokenizer = self.model_config.tokenizer
+        enc = tokenizer(
+            quality_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=getattr(self.model_config, "max_position_embeddings", 4096),
+        )
+        # 为部分后端（如 vLLM）补充 position_ids
+        try:
+            from verl.utils.model import compute_position_id_with_mask
+            position_ids = compute_position_id_with_mask(
+                enc.get("attention_mask", torch.ones_like(enc["input_ids"]))
+            )
+        except Exception:
+            bsz, seqlen = enc["input_ids"].shape
+            position_ids = torch.arange(seqlen, dtype=torch.long).unsqueeze(0).expand(bsz, seqlen)
+        td = TensorDict(
+            source={
+                "input_ids": enc["input_ids"],
+                "attention_mask": enc.get("attention_mask", torch.ones_like(enc["input_ids"])),
+                "position_ids": position_ids,
+            },
+            batch_size=(len(quality_prompts),),
+        )
+
+        return DataProto(
+            batch=td,
+            non_tensor_batch={"prompt_texts": np.array(quality_prompts, dtype=object)},
+            meta_info={},
+        )
+        
+        # NOTE: The block below is intentionally kept as comments for reference.
+        # It duplicates the functionality above and was previously unreachable due to the early return.
+        # Keeping it commented preserves historical context without affecting runtime.
+        #
+        # tokenized_prompts = self.model_config.tokenizer(
+        #     quality_prompts,
+        #     return_tensors="pt",
+        #     padding=True,
+        #     truncation=True,
+        #     max_length=2048,
+        # )
+        # 
+        # quality_data = DataProto()
+        # quality_data.batch = {
+        #     "input_ids": tokenized_prompts["input_ids"],
+        #     "attention_mask": tokenized_prompts["attention_mask"],
+        # }
+        # quality_data.non_tensor_batch = {
+        #     "prompt_texts": quality_prompts,
+        # }
+        # 
+        # return quality_data
+        
+    
+    def _extract_quality_scores_from_generation(self, data: DataProto):
+        # Extract quality scores from generated text
+        # 从responses token IDs中解码出文本
+        responses = data.batch.get("responses", None)
+        if responses is None:
+            # 如果没有responses，返回默认分数
+            if "input_ids" in data.batch and data.batch["input_ids"].shape[0] > 0:
+                batch_size = data.batch["input_ids"].shape[0]
+                # 原始版本：只返回分数
+                # return torch.full((batch_size,), 0.5, dtype=torch.float32, device="cpu")
+                # 修改版本：同时返回评价文本
+                return torch.full((batch_size,), 0.5, dtype=torch.float32, device="cpu"), [""] * batch_size
+            else:
+                # 如果连input_ids都没有，返回空tensor
+                # 原始版本：只返回分数
+                # return torch.empty((0,), dtype=torch.float32, device="cpu")
+                # 修改版本：同时返回评价文本
+                return torch.empty((0,), dtype=torch.float32, device="cpu"), []
+        
+        # 直接依赖文本正则提取 #### ，不再做 \box 兼容
+        try:
+            tokenizer = self.model_config.tokenizer
+            import re as _re  # local alias to avoid shadowing later
+
+            def encode_char_get_first_id(ch):
+                enc = tokenizer(str(ch), return_tensors="pt")
+                ids = enc["input_ids"][0].tolist()
+                # 取第一个既不是pad也不是eos的id
+                for tid in ids:
+                    if tid not in (getattr(tokenizer, "pad_token_id", None), getattr(tokenizer, "eos_token_id", None)):
+                        return tid
+                return None
+
+            # 不再做 token 级别盒子匹配，直接走文本解码路径
+        except Exception:
+            # 安全回退到文本解码路径
+            pass
+
+        # 解码responses为文本（回退方案）
+        generated_texts = []
+        for i in range(responses.shape[0]):
+            response_tokens = responses[i]
+            # 移除padding tokens
+            valid_tokens = response_tokens[response_tokens != self.model_config.tokenizer.pad_token_id]
+            if len(valid_tokens) > 0:
+                text = self.model_config.tokenizer.decode(valid_tokens, skip_special_tokens=True)
+                generated_texts.append(text)
+            else:
+                generated_texts.append("")
+        
+        if not generated_texts or all(text == "" for text in generated_texts):
+            # 如果没有生成文本或所有文本都为空，返回默认分数
+            if "input_ids" in data.batch and data.batch["input_ids"].shape[0] > 0:
+                batch_size = data.batch["input_ids"].shape[0]
+                # 原始版本：只返回分数
+                # return torch.full((batch_size,), 0.5, dtype=torch.float32, device="cpu")
+                # 修改版本：同时返回评价文本
+                return torch.full((batch_size,), 0.5, dtype=torch.float32, device="cpu"), [""] * batch_size
+            else:
+                # 如果连input_ids都没有，返回空tensor
+                # 原始版本：只返回分数
+                # return torch.empty((0,), dtype=torch.float32, device="cpu")
+                # 修改版本：同时返回评价文本
+                return torch.empty((0,), dtype=torch.float32, device="cpu"), []
+        
+        quality_scores = []
+        import re
+        for i, text in enumerate(generated_texts):
+            # 仅提取以 #### 开头的分数（规范格式）
+            hash_pattern = r'^\s*####\s*([0-9]+(?:\.[0-9]+)?)\s*$'
+            m = re.findall(hash_pattern, text, flags=re.MULTILINE)
+            if len(m) > 0:
+                try:
+                    raw_score = float(m[-1])
+                    # 改进的分数归一化：如果分数>1，则除以10；如果分数<=1，则直接使用
+                    if raw_score > 10:
+                        normalized_score = 10
+                    else:
+                        normalized_score = raw_score
+                    # 确保分数在合理范围内
+                    normalized_score = max(0.0, min(10.0, normalized_score))
+                except Exception:
+                    normalized_score = 0.5
+                quality_scores.append(normalized_score)
+                continue
+
+            # 若未命中规范行，则给默认分数
+            quality_scores.append(0.5)
+        
+        # 调试信息：记录生成的文本和提取的分数
+        if len(generated_texts) > 0:
+            logger.debug(f"生成了 {len(generated_texts)} 个质量评分文本")
+            logger.debug(f"第一个生成的文本: {generated_texts[0][:200]}...")
+            logger.debug(f"提取的分数: {quality_scores[:3] if len(quality_scores) >= 3 else quality_scores}")
+        
+        # 转换为tensor
+        quality_scores = torch.tensor(quality_scores, dtype=torch.float32)
+        
+        # 对于质量评分，我们返回每个样本的分数，不需要扩展到每个token
+        # 因为质量评分是针对整个回答的，不是token级别的
+        # 原始版本：只返回分数
+        # return quality_scores
+        # 修改版本：同时返回生成的评价文本
+        return quality_scores, generated_texts
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
