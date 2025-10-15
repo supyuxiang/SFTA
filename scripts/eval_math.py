@@ -9,6 +9,7 @@ import json
 import os
 import re
 from pathlib import Path
+from tqdm import tqdm
 
 import pandas as pd
 import torch
@@ -223,7 +224,7 @@ def evaluate_math(model_dir: str, val_parquet: str,
     combined_sum = 0.0
     detailed_results = []
 
-    for i in range(0, len(prompts), batch_size):
+    for i in tqdm(range(0, len(prompts), batch_size), desc="Processing batches"):
         batch_prompts = prompts[i:i+batch_size]
         batch_labels = labels[i:i+batch_size]
         

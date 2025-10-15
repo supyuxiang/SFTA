@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Restrict to the specified GPUs only
-export CUDA_VISIBLE_DEVICES=6,7,8,9
+export CUDA_VISIBLE_DEVICES=8,9
 
 PY="/home/yxfeng/miniconda3/envs/fyx_verl/bin/python"
 REPO_ROOT="/home/yxfeng/verl"
@@ -22,15 +22,15 @@ MODELS=(
   "/data1/yxfeng/models/qwen/Qwen2.5-0.5B-Instruct"
   "/data1/yxfeng/models/qwen/Qwen2.5-1.5B-Instruct"
   "/data1/yxfeng/models/qwen/Qwen2.5-3B-Instruct"
-  "/data1/yxfeng/models/qwen/Qwen2.5-7B-Instruct"
   "/data1/yxfeng/models/qwen/Qwen2.5-Math-1.5B"
   "/data1/yxfeng/models/qwen/Qwen2.5-Math-7B"
+  "/data1/yxfeng/models/qwen/Qwen2.5-7B-Instruct"
 )
 
 # Reasonable defaults (adjust if needed)
-BATCH_SIZE=${BATCH_SIZE:-4}
-MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-512}
-MAX_GEN_LEN=${MAX_GEN_LEN:-512}
+BATCH_SIZE=${BATCH_SIZE:-128}
+MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-2048}
+MAX_GEN_LEN=${MAX_GEN_LEN:-2048}
 
 echo "[INFO] Evaluating ${#MODELS[@]} models on MATH (VAL: $VAL_PARQUET) using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" >&2
 
