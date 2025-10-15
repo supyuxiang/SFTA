@@ -89,7 +89,13 @@ def main() -> None:
             new_token = out[0, -1:]
             generated = out
             if attention_mask is not None:
-                attention_mask = torch.cat([attention_mask, torch.ones_like(new_token)], dim=-1)
+                # attention_mask has shape [batch, seq_len]; append a column of ones
+                ones_col = torch.ones(
+                    (attention_mask.size(0), 1),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                attention_mask = torch.cat([attention_mask, ones_col], dim=-1)
             token_text = tokenizer.decode(new_token, skip_special_tokens=True)
             print(token_text, end="", flush=True)
             if gen_kwargs["eos_token_id"] is not None and new_token.item() == gen_kwargs["eos_token_id"]:
