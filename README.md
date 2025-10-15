@@ -261,3 +261,22 @@ Founded in 2023, ByteDance Seed Team is dedicated to crafting the industry's mos
 ---
 
 We are HIRING! Send us an [email](mailto:the.verl.project@gmail.com) if you are interested in internship/FTE opportunities in RL for agents.
+
+
+
+
+
+
+
+
+
+installation:
+conda create -n verl python==3.10
+conda activate verl
+
+# Make sure you have activated verl conda env
+# If you need to run with megatron
+bash scripts/install_vllm_sglang_mcore.sh
+# Or if you simply need to run with FSDP
+USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh
+# SFTA
